@@ -1,0 +1,17 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- NoNative launcher icon: iOS-style tile with a geometric lowercase n -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2E9BFF"/>
+      <stop offset="1" stop-color="#0A6BFC"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="230" fill="url(#bg)"/>
+
+  <!-- geometric n: half annulus arch + two round-bottomed stems -->
+  <path fill="#FFFFFF" d="
+    M300,472 A212,212 0 0 1 724,472 L574,472 A62,62 0 0 0 450,472 Z
+    M300,472 L300,699 Q300,744 345,744 L405,744 Q450,744 450,699 L450,472 Z
+    M574,472 L574,699 Q574,744 619,744 L679,744 Q724,744 724,699 L724,472 Z"/>
+</svg>
