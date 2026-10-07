@@ -52,3 +52,10 @@ verdict only means no listed evidence was found, not that the device is untouche
 Detection ideas credited to [@eltavine](https://github.com/eltavine)
 ([Duck-Detector-Refactoring](https://github.com/eltavine/Duck-Detector-Refactoring)),
 also listed as a commit co-author.
+
+## License
+
+Copyright (C) 2026 JavSaia
+
+This project is licensed under the GNU General Public License version 2 **only**
+(SPDX: `GPL-2.0-only`) — see [LICENSE](LICENSE).
