@@ -12,13 +12,20 @@ android {
         applicationId = "com.example.nonative"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.0.0"
+    }
+
+    signingConfigs {
+        // reuse the debug keystore so the release APK is installable without
+        // shipping secrets; swap in a dedicated keystore before wide distribution
+        getByName("debug")
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

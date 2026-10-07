@@ -4,6 +4,10 @@ package com.example.nonative
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
+import android.util.Log
 import java.io.File
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -30,7 +34,10 @@ object RootDetector {
     }
 
     /** Root tooling keywords used for property-name/value and process-name scans */
-    private val ROOT_TOKENS = listOf("magisk", "zygisk", "kernelsu", "ksu", "apatch", "supersu", "daemonsu")
+    private val ROOT_TOKENS = listOf("magisk", "zygisk", "kernelsu", "ksu", "apatch", "kpatch", "susfs", "supersu", "daemonsu")
+
+    /** Extended keywords for kernel-side artifacts (kallsyms, modules, version strings) */
+    private val KERNEL_TOKENS = ROOT_TOKENS
 
     /** Additional keywords only meaningful for process / socket scans */
     private val PROCESS_TOKENS = ROOT_TOKENS + listOf("frida", "linjector")
@@ -128,6 +135,7 @@ object RootDetector {
         findings += checkXposedRuntime()
         findings += checkMaps()
         findings += checkMounts()
+        findings += checkMountinfo()
         findings += checkProcesses()
         findings += checkProperties(props)
         findings += checkBootParams(props)
@@ -136,11 +144,16 @@ object RootDetector {
         findings += checkKernelVersion()
         findings += checkKernelIdentity()
         findings += checkKernelVisibility()
+        findings += checkDevpts()
+        findings += checkLocalTmp()
         findings += checkProcStatus(context)
         findings += checkUnixSockets()
         findings += checkEmulatorNodes()
         findings += checkKeyAttestation()
         findings += checkBusybox()
+        for (f in findings) {
+            Log.d("NoNative", (if (f.danger) "D" else "W") + " | " + f.category + " | " + f.detail)
+        }
         return Report(
             dangers = findings.filter { it.danger }.distinctBy { it.category + it.detail },
             warnings = findings.filterNot { it.danger }.distinctBy { it.category + it.detail },
@@ -150,21 +163,50 @@ object RootDetector {
     // ---------- SU binaries and root-scheme directories ----------
 
     private fun checkSuBinaries(): List<Finding> {
-        val hits = SU_PATHS.filter { File(it).exists() }.toMutableList()
+        val hits = ArrayList<String>()
+        val hidden = ArrayList<String>()
+        for (path in SU_PATHS) {
+            try {
+                Os.stat(path)
+                hits += path
+            } catch (e: ErrnoException) {
+                // stock policy lets apps stat system/vendor/product paths, so a denial
+                // there means the file exists but is hidden from apps — the hiding leaks
+                val denied = e.errno == OsConstants.EACCES || e.errno == OsConstants.EPERM
+                val gated = path.startsWith("/system") || path.startsWith("/vendor") || path.startsWith("/product")
+                if (denied && gated) hidden += path
+            } catch (t: Throwable) {
+            }
+        }
         for (name in listOf("su", "magisk", "ksud", "daemonsu")) {
             val p = exec("which", name)
             if (p.isNotEmpty() && !hits.contains(p)) hits += p
         }
-        return if (hits.isEmpty()) emptyList()
-        else listOf(Finding("SU binaries", "SU/root tool artifacts found: " + hits.joinToString(", "), danger = true))
+        val out = ArrayList<Finding>()
+        if (hits.isNotEmpty()) {
+            out += Finding("SU binaries", "SU/root tool artifacts found: " + hits.joinToString(", "), danger = true)
+        }
+        if (hidden.isNotEmpty()) {
+            out += Finding(
+                "Hidden su paths",
+                "stat denied where stock policy allows it (su exists but hidden): " + hidden.joinToString(", "),
+                danger = true,
+            )
+        }
+        return out
     }
 
     private fun checkRootDirs(): List<Finding> {
         val hits = ROOT_DIRS.filter { File(it).exists() }
-        // /data/adb is adb_data_file: when the app lacks the SELinux search permission
-        // stat returns EACCES and File.exists() yields false — absence here is not proof
-        return if (hits.isEmpty()) emptyList()
-        else listOf(Finding("Root directories", "Root-scheme directories found: " + hits.joinToString(", "), danger = true))
+        // modern AOSP init.rc also creates /data/adb, and userdebug/permissive systems
+        // let apps stat it — the hit is only root evidence under an enforcing policy
+        val enforcing = readText("/sys/fs/selinux/enforce")?.trim() == "1"
+        if (hits.isEmpty()) return emptyList()
+        return if (enforcing) {
+            listOf(Finding("Root directories", "Root-scheme directories found (SELinux enforcing): " + hits.joinToString(", "), danger = true))
+        } else {
+            listOf(Finding("Root directories", "Root-scheme directories visible without an SELinux gate (userdebug expectation or hiding, hint only): " + hits.joinToString(", "), danger = false))
+        }
     }
 
     private fun checkPaths(paths: List<String>, category: String, prefix: String, danger: Boolean): List<Finding> {
@@ -285,6 +327,90 @@ object RootDetector {
             }
         }
         return out
+    }
+
+    // ---------- mountinfo: module overlay leaks + cross-view consistency ----------
+
+    private fun unescapeMount(s: String): String = s
+        .replace("\\134", "\\")
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+
+    private fun checkMountinfo(): List<Finding> {
+        val out = ArrayList<Finding>()
+        val info = readText("/proc/self/mountinfo") ?: return out
+        val infoPoints = HashSet<String>()
+        for (line in info.lineSequence()) {
+            val f = line.split(" ")
+            if (f.size < 5) continue
+            val root = unescapeMount(f[3])
+            val mp = unescapeMount(f[4])
+            infoPoints += mp
+            // module overlays keep their backing store in the root field even when
+            // the mountpoint looks innocent (e.g. /data/adb/modules/.../system)
+            if (root.startsWith("/data/adb") || KERNEL_TOKENS.any { root.contains(it, true) }) {
+                out += Finding("Module overlay", "mountinfo exposes overlay root $root on $mp", danger = true)
+            }
+        }
+        // /proc/self/mounts and /proc/self/mountinfo describe the same namespace;
+        // a hiding tool that filters only one of them leaves a mismatch behind
+        val mounts = readText("/proc/self/mounts")
+        if (mounts != null && infoPoints.isNotEmpty()) {
+            val mountPoints = mounts.lineSequence()
+                .map { it.split(" ") }
+                .filter { it.size >= 2 }
+                .map { unescapeMount(it[1]) }
+                .toSet()
+            if (mountPoints != infoPoints) {
+                val onlyMounts = (mountPoints - infoPoints).take(3).joinToString(", ")
+                val onlyInfo = (infoPoints - mountPoints).take(3).joinToString(", ")
+                out += Finding(
+                    "Mount cross-view mismatch",
+                    "mounts vs mountinfo disagree (hiding traces): [$onlyMounts] vs [$onlyInfo]",
+                    danger = true,
+                )
+            }
+        }
+        return out
+    }
+
+    // ---------- devpts PTY labels (KernelSU ksu_file leak) ----------
+
+    private fun checkDevpts(): List<Finding> {
+        val entries = File("/dev/pts").list() ?: return emptyList()
+        val hits = ArrayList<String>()
+        for (e in entries) {
+            try {
+                val label = String(Os.getxattr("/dev/pts/$e", "security.selinux")).trim('\u0000')
+                if (label.contains("ksu_file", true) || KERNEL_TOKENS.any { label.contains(it, true) }) {
+                    hits += "$e=$label"
+                }
+            } catch (t: Throwable) {
+                // xattr read denied → probe unavailable, never guess
+                return emptyList()
+            }
+        }
+        return if (hits.isEmpty()) emptyList()
+        else listOf(Finding("su PTY label", "devpts PTYs carry root-tool labels: " + hits.joinToString(", "), danger = true))
+    }
+
+    // ---------- /data/local/tmp DAC metadata (AOSP expects shell:shell 2000:2000) ----------
+
+    private fun checkLocalTmp(): List<Finding> {
+        return try {
+            val st = Os.stat("/data/local/tmp")
+            if (st.st_uid == 2000 && st.st_gid == 2000) emptyList()
+            else listOf(
+                Finding(
+                    "Shell tmp",
+                    "/data/local/tmp owner is ${st.st_uid}:${st.st_gid}, AOSP init creates 2000:2000 (rebuilt by root tooling?)",
+                    danger = false,
+                ),
+            )
+        } catch (t: Throwable) {
+            emptyList()
+        }
     }
 
     // ---------- process scan ----------
@@ -480,10 +606,16 @@ object RootDetector {
         val marked = v.any { c ->
             (c.code in 0x2E80..0x9FFF) || (c.code in 0x1F000..0x1FAFF) || c == '@'
         }
-        return if (marked) {
-            listOf(Finding("Kernel traces", "/proc/version contains non-standard characters (custom kernel, hint only)", danger = false))
-        } else {
-            emptyList()
+        // root tooling baked into a custom kernel leaks its own name
+        val tokens = KERNEL_TOKENS.filter { v.contains(it, true) }
+        return when {
+            tokens.isNotEmpty() -> listOf(
+                Finding("Kernel traces", "/proc/version carries root-tool tokens (" + tokens.joinToString(", ") + ")", danger = true),
+            )
+            marked -> listOf(
+                Finding("Kernel traces", "/proc/version contains non-standard characters (custom kernel, hint only)", danger = false),
+            )
+            else -> emptyList()
         }
     }
 
@@ -506,17 +638,26 @@ object RootDetector {
 
     private fun checkKernelVisibility(): List<Finding> {
         val out = ArrayList<Finding>()
+        val osrelease = readText("/proc/sys/kernel/osrelease") ?: ""
+        if (osrelease.isNotEmpty()) {
+            val tokens = KERNEL_TOKENS.filter { osrelease.contains(it, true) }
+            if (tokens.isNotEmpty()) {
+                out += Finding("Kernel symbols", "kernel release carries root-tool tokens (" + tokens.joinToString(", ") + ")", danger = true)
+            }
+        }
         val kallsyms = readText("/proc/kallsyms")
         if (kallsyms != null && kallsyms.length > 1000) {
             out += Finding("Kernel symbols", "/proc/kallsyms readable by the app (kernel pointers exposed, hint only)", danger = false)
-            if (ROOT_TOKENS.any { kallsyms.contains(it, true) }) {
-                out += Finding("Kernel symbols", "root tool symbols found in kallsyms", danger = true)
+            val tokens = KERNEL_TOKENS.filter { kallsyms.contains(it, true) }
+            if (tokens.isNotEmpty()) {
+                out += Finding("Kernel symbols", "root tool symbols found in kallsyms (" + tokens.joinToString(", ") + ")", danger = true)
             }
         }
         val modules = readText("/proc/modules")
         if (modules != null && modules.isNotEmpty()) {
-            if (ROOT_TOKENS.any { modules.contains(it, true) }) {
-                out += Finding("Kernel modules", "root tool kernel modules loaded", danger = true)
+            val tokens = KERNEL_TOKENS.filter { modules.contains(it, true) }
+            if (tokens.isNotEmpty()) {
+                out += Finding("Kernel modules", "root tool kernel modules loaded (" + tokens.joinToString(", ") + ")", danger = true)
             }
         }
         return out

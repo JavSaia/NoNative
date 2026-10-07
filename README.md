@@ -23,9 +23,10 @@ Requires JDK 17, Android SDK (minSdk 29 / compileSdk 36).
 
 | Area | Checks |
 |---|---|
-| su / SU binaries | fixed-path scan + `which` for su/magisk/ksud/daemonsu |
+| su / SU binaries | fixed-path scan via `stat` (errno separates *hidden* su from absent), `which` fallback |
+| anti-hiding | mounts vs mountinfo cross-view, mountinfo overlay-root leak, devpts `ksu_file` PTY labels, `/data/local/tmp` owner, `/data/adb` verdict gated on SELinux enforcing |
 | su — root schemes | `/data/adb`, `/sbin/.magisk`, KernelSU/APatch/Magisk dirs, `/data/local/tmp` payloads |
-| nativeroot | daemon/prop/process scans, uid-0 self check, `/proc/net/unix` socket names, kallsyms & module list (best effort) |
+| nativeroot | daemon/prop/process scans, uid-0 self check, `/proc/net/unix` socket names, kallsyms & module list with root-tool token scan (best effort) |
 | dangerous apps | package scan: Magisk/KernelSU/APatch/SuperSU/KingRoot/Xposed/LSPosed/LSPatch/HMA/TaiChi/MMRL, shell tools as hint |
 | lsposed / zygisk | runtime class probes, boot-classpath probe, call-stack sampling across several call paths, `/proc/self/maps` library tokens |
 | mount | Magisk paths in `/proc/self/mounts`, overlay on `/`, writable system partitions, loop devices |

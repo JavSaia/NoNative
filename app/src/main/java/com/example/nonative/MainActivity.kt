@@ -46,10 +46,13 @@ class MainActivity : Activity() {
 
         hideSystemBars()
         hintView.text = "Scanning…"
-        Thread {
-            val report = RootDetector.detect(applicationContext)
-            runOnUiThread { show(report) }
-        }.start()
+        if (savedInstanceState == null) {
+            // immersive-mode focus changes can recreate the activity; scan only once
+            Thread {
+                val report = RootDetector.detect(applicationContext)
+                runOnUiThread { show(report) }
+            }.start()
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
